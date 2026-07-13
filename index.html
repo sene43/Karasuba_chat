@@ -240,6 +240,7 @@
     background:rgba(154,107,216,.1);
     border-top:1px solid rgba(154,107,216,.25);
   }
+  #attachPreview[hidden]{display:none !important}
   #attachPreview img{
     width:44px;height:44px;object-fit:cover;border-radius:10px;
   }
@@ -367,6 +368,7 @@
     <div class="partner-sub" id="headerSub">おう、来たか</div>
   </div>
   <div class="header-spacer"></div>
+  <button class="icon-btn" id="modeBtn" aria-label="世界観モード切替">📱</button>
   <button class="icon-btn" id="openSearch" aria-label="メッセージ検索">🔎</button>
   <button class="icon-btn" id="openThreads" aria-label="話題を切り替える">💬</button>
   <button class="icon-btn" id="openSettings" aria-label="設定">⚙︎</button>
@@ -633,6 +635,20 @@
 
   function curThread(){ return threads.find(t => t.id === curId); }
 
+  const modeBtn = document.getElementById('modeBtn');
+  function updateModeBtn(){
+    const together = get(LS.world,'app') === 'together';
+    modeBtn.textContent = together ? '🏠' : '📱';
+    modeBtn.title = together ? '今：同じ家で一緒にいる（タップでメッセージモードへ）' : '今：メッセージでやりとり（タップで一緒にいるモードへ）';
+  }
+  modeBtn.addEventListener('click', () => {
+    const together = get(LS.world,'app') === 'together';
+    localStorage.setItem(LS.world, together ? 'app' : 'together');
+    updateModeBtn();
+    const sel = document.getElementById('worldSel');
+    if (sel) sel.value = get(LS.world,'app');
+  });
+
   function updateHeader(){
     document.getElementById('headerName').textContent = get(LS.name,'カラスバ');
     const t = curThread();
@@ -768,7 +784,7 @@
     }
     out += '\n\n【リンクのルール】動画やサイトを勧める時、URLを記憶から創作してはいけない（存在しないリンクになる）。YouTubeの動画を勧める時は、必ず https://www.youtube.com/results?search_query=検索キーワード の形式の検索リンクで案内する（キーワードはURLエンコード不要、スペースは+にする）。個別動画の直リンクは、相手が貼ってくれたURLを参照する場合だけ使ってよい。';
     if (/gemma/i.test(get(LS.model,''))){
-      out += '\n\n【出力ルール（厳守）】返答は、キャラクターとしてのセリフと（ト書き）だけを日本語で出力すること。思考過程・計画・分析・箇条書きのメモ・英語のテキストは、どんな形でも絶対に出力しない。「Action:」「Dialogue:」のようなラベルや見出し、行頭の記号（*・-）も一切使わず、地の文とセリフだけを自然に書くこと。';
+      out += '\n\n【出力ルール（厳守）】1文字目から日本語の本文（セリフと（ト書き））だけを書き始めること。英語での思考・下書き・チェックリスト・分析・箇条書きは、どんな形でも絶対に出力しない。本文は一度だけ書く（同じ文章を二度繰り返さない）。「Action:」「Dialogue:」のようなラベルや見出し、行頭の記号（*・-）も一切使わない。';
     }
     return out;
   }
@@ -1120,35 +1136,43 @@
     return t.replace(/[ \t]{2,}/g,' ').replace(/\n{3,}/g,'\n\n').trim();
   }
 
-  // Gemmaが英語の思考メモを漏らした場合、冒頭の英語ブロックを削って本文だけ残す
+  // Gemmaが英語の思考・下書きを漏らした場合、最後の日本語ブロック（＝本番の返事）だけを残す
   function stripLeak(text){
     const lines = text.split('\n');
-    const jpRe = /[ぁ-んァ-ヶ一-龯]/;
-    let i = 0;
-    while (i < lines.length){
-      const t = lines[i].trim();
-      if (!t){ i++; continue; }                     // 冒頭の空行は読み飛ばす
-      const ascii = (t.match(/[\x00-\x7F]/g) || []).length;
-      const heavy = ascii / t.length > 0.7;
-      const engStart = /^[\*\-•>]*\s*[A-Za-z"'\[]/.test(t);
-      if (!jpRe.test(t) && (heavy || engStart)){ i++; continue; }  // 日本語ゼロの英語行→捨てる
-      if (engStart && jpRe.test(t)){
-        // 英語メモと日本語本文が同じ行に融合→日本語が始まる位置から残す
-        // ただし「OKだよ」みたいな短い英語prefixの普通の返事は切らない
-        const m = t.search(jpRe);
-        const bullet = /^[\*\-•>]/.test(t);
-        if (bullet || m > 15){
-          let start = m;
-          if (m > 0 && (t[m-1] === '（' || t[m-1] === '(')) start = m - 1;
-          lines[i] = t.slice(start);
-        }
-        break;
-      }
-      if (heavy){ i++; continue; }
-      break;
+    const isJpLine = (raw) => {
+      const s = raw.trim();
+      if (!s) return null; // 空行は中立
+      const jp = (s.match(/[ぁ-んァ-ヶ一-龯]/g) || []).length;
+      const en = (s.match(/[A-Za-z]/g) || []).length;
+      if (jp === 0) return !/[A-Za-z]{2,}/.test(s); // 記号・顔文字だけならOK、英単語があればNG
+      return jp * 2 >= en; // 日本語優勢ならOK
+    };
+    let end = lines.length - 1;
+    while (end >= 0 && lines[end].trim() === '') end--;
+    if (end < 0) return text.trim();
+    let start = end;
+    for (let i = end; i >= 0; i--){
+      const c = isJpLine(lines[i]);
+      if (c === false) break;
+      if (c === true) start = i;
     }
-    const out = lines.slice(i).join('\n').trim();
-    return out || text.trim();
+    let out = lines.slice(start, end + 1).join('\n').trim();
+    if (!out) return text.trim();
+    return dedupeReply(out);
+  }
+
+  // 下書きと完成版で同じ本文が2回出てきたら、後半（完成版）だけ残す
+  function dedupeReply(t){
+    const lines = t.split('\n');
+    const firstLine = (lines.find(l => l.trim()) || '').trim();
+    if (firstLine.length < 10) return t;
+    const lastIdx = t.lastIndexOf(firstLine);
+    const firstIdx = t.indexOf(firstLine);
+    if (lastIdx > firstIdx && lastIdx > t.length * 0.25){
+      const tail = t.slice(lastIdx).trim();
+      if (tail.length >= t.length * 0.35) return tail;
+    }
+    return t;
   }
 
   function safetySettings(){
@@ -1812,6 +1836,7 @@
     localStorage.setItem(LS.light, document.getElementById('lightTheme').checked ? '1':'0');
     applySkin();
     updateHeader();
+    updateModeBtn();
     closeSheets();
     renderAll();
   });
@@ -2065,6 +2090,7 @@
   initThreads();
   applySkin();
   updateHeader();
+  updateModeBtn();
   renderAll();
   if (activeKeyMissing()) {
     setTimeout(openSheet, 600);
