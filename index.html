@@ -1266,36 +1266,76 @@
     }
 
     // 一時的なエラー（混雑・500系）は少し待って自動リトライ
-    let res, data, lastErr = '';
-    for (let attempt = 0; attempt < 3; attempt++){
-      if (attempt > 0) await new Promise(r => setTimeout(r, 1200 * attempt));
-      try {
-        res = await fetch(url, { method:'POST', headers: headers, body: JSON.stringify(body) });
-      } catch(netErr){
-        lastErr = netErr.message; continue;
+    async function runOnce(u, h, b, ex){
+      let res, data, lastErr = '';
+      for (let attempt = 0; attempt < 3; attempt++){
+        if (attempt > 0) await new Promise(r => setTimeout(r, 1200 * attempt));
+        try {
+          res = await fetch(u, { method:'POST', headers: h, body: JSON.stringify(b) });
+        } catch(netErr){
+          lastErr = netErr.message; continue;
+        }
+        data = await res.json();
+        if (res.ok) break;
+        const msg = (data && data.error && (data.error.message || data.error.type)) || ('HTTP ' + res.status);
+        lastErr = msg;
+        const transient = res.status === 500 || res.status === 503 || res.status === 429 || res.status === 529 ||
+          /internal error|overloaded|unavailable|try again/i.test(msg);
+        if (!transient) throw new Error(msg);
       }
-      data = await res.json();
-      if (res.ok) break;
-      const msg = (data && data.error && (data.error.message || data.error.type)) || ('HTTP ' + res.status);
-      lastErr = msg;
-      const transient = res.status === 500 || res.status === 503 || res.status === 429 || res.status === 529 ||
-        /internal error|overloaded|unavailable|try again/i.test(msg);
-      if (!transient) throw new Error(msg);
+      if (!res || !res.ok) throw new Error(lastErr || 'Internal error');
+      return { data: data, reply: ex(data) || '' };
     }
-    if (!res || !res.ok) throw new Error(lastErr || 'Internal error');
 
-    // 使用トークンを記録（各社の返事に正確な数が入っている）
+    let data, reply;
     try {
-      if (provider === 'gemini' && data.usageMetadata){
-        addTokens(data.usageMetadata.promptTokenCount, data.usageMetadata.candidatesTokenCount);
-      } else if ((provider === 'openai' || provider === 'openrouter') && data.usage){
-        addTokens(data.usage.prompt_tokens, data.usage.completion_tokens);
-      } else if (provider === 'anthropic' && data.usage){
-        addTokens(data.usage.input_tokens, data.usage.output_tokens);
+      const r1 = await runOnce(url, headers, body, extract);
+      data = r1.data; reply = r1.reply;
+      // 使用トークンを記録（各社の返事に正確な数が入っている）
+      try {
+        if (provider === 'gemini' && data.usageMetadata){
+          addTokens(data.usageMetadata.promptTokenCount, data.usageMetadata.candidatesTokenCount);
+        } else if ((provider === 'openai' || provider === 'openrouter') && data.usage){
+          addTokens(data.usage.prompt_tokens, data.usage.completion_tokens);
+        } else if (provider === 'anthropic' && data.usage){
+          addTokens(data.usage.input_tokens, data.usage.output_tokens);
+        }
+      } catch(e){}
+    } catch(err){
+      // 新世代Geminiモデルが旧API非対応だった場合、新しいInteractions APIで自動再挑戦
+      if (provider === 'gemini' && /no longer available|interactions/i.test(err.message)){
+        const gKey = get(LS.key,'');
+        let convo = fullSystemPrompt() + '\n\n【これまでの会話】\n';
+        history.slice(-40).forEach(m => {
+          convo += (m.role === 'model' ? '相手' : 'ユーザー') + '：' + m.text + '\n';
+        });
+        if (extraHiddenPrompt) convo += 'ユーザー：' + extraHiddenPrompt + '\n';
+        convo += '\n上記の人物設定になりきり、この会話の続きとして、あなた（相手側）の次の返事の本文だけを出力してください。';
+        const input2 = [];
+        if (image) input2.push({ type:'image', mime_type: image.mime, data: image.data });
+        input2.push({ type:'text', text: convo });
+        const r2 = await runOnce(
+          'https://generativelanguage.googleapis.com/v1beta2/interactions',
+          { 'Content-Type':'application/json', 'x-goog-api-key': gKey },
+          { model: model, store: false, input: input2 },
+          d => {
+            let t = '';
+            (d.steps || []).forEach(st => {
+              if (st.type === 'model_output' && st.content){
+                st.content.forEach(c => { if (c.type === 'text' && c.text) t += c.text; });
+              }
+            });
+            return t;
+          }
+        );
+        data = r2.data; reply = r2.reply;
+        try {
+          if (data && data.usage) addTokens(data.usage.prompt_tokens, data.usage.completion_tokens);
+        } catch(e){}
+      } else {
+        throw err;
       }
-    } catch(e){}
-
-    let reply = extract(data) || '';
+    }
     if (reply){
       reply = reply.replace(/https?:\/\/[^\s]+/g, m =>
         m.replace(/[＝？＆／：．＋]/g, c =>
@@ -1777,12 +1817,6 @@
         const lum = avgLuminance(canvas);
         localStorage.setItem(LS.light, lum > 140 ? '1' : '0');
         document.getElementById('lightTheme').checked = flag0(LS.light);
-    document.getElementById('uName').value = get(LS.uname,'');
-    document.getElementById('uIntro').value = get(LS.uintro,'');
-    fontSlider.value = get(LS.fsize,'15');
-    document.getElementById('fontVal').textContent = get(LS.fsize,'15');
-    document.getElementById('apiTestResult').textContent = '';
-    showTab('conn');
         applySkin();
       } catch(e){
         alert('画像が大きすぎて保存できなかった…もう少し小さい画像で試してみて');
@@ -2020,6 +2054,12 @@
     document.getElementById('useVoice').checked = flag0(LS.voice);
     document.getElementById('useSearch').checked = flag0(LS.search);
     document.getElementById('lightTheme').checked = flag0(LS.light);
+    document.getElementById('uName').value = get(LS.uname,'');
+    document.getElementById('uIntro').value = get(LS.uintro,'');
+    fontSlider.value = get(LS.fsize,'15');
+    document.getElementById('fontVal').textContent = get(LS.fsize,'15');
+    document.getElementById('apiTestResult').textContent = '';
+    showTab('conn');
     updateStorageMeter();
     sheet.classList.add('show'); overlay.classList.add('show');
   }
@@ -2359,7 +2399,7 @@
         if (res.ok) reply = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || '';
       }
       if (res.ok) out.textContent = '✓ 接続成功！ ' + model + ' →「' + (reply || '応答あり').trim().slice(0, 30) + '」';
-      else out.textContent = '✗ 失敗: ' + ((data && data.error && (data.error.message || data.error.type)) || ('HTTP ' + res.status));
+      else out.textContent = '✗ 失敗: ' + ((data && data.error && (data.error.message || data.error.type)) || ('HTTP ' + res.status)) + '（no longer availableと出たら、🔄で一覧を更新して新しい世代のモデルを選んでみて。実際の会話では新APIへの自動切替も効くよ）';
     } catch(e){
       out.textContent = '✗ 通信エラー: ' + e.message;
     }
